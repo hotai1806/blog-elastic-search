@@ -3,6 +3,9 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from elasticsearch import Elasticsearch
+from fastapi.openapi.utils import get_openapi
+
+
 import redis
 import os
 from datetime import datetime
@@ -128,7 +131,6 @@ def search_posts(query: str):
             }
         }
     )
-    
     # Format results
     hits = search_results["hits"]["hits"]
     results = []
@@ -140,6 +142,15 @@ def search_posts(query: str):
         results.append(result)
     
     return {"results": results, "count": len(results)}
+
+@app.get("/docs")
+async def get_openapi_documentation():
+    return get_openapi(
+        title="Blog Search API",
+        version="1.0.0",
+        description="API for searching and managing blog posts",
+        routes=app.routes,
+    )
 
 if __name__ == "__main__":
     import uvicorn
