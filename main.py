@@ -86,11 +86,11 @@ def create_post(title: str, content: str, author: str, db: Session = Depends(get
     db.add(db_post)
     db.commit()
     db.refresh(db_post)
-    
+
     # Index in Elasticsearch
     post_dict = db_post.to_dict()
     es.index(index="blog_posts", id=db_post.id, document=post_dict)
-    
+
     return {"message": "Post created successfully", "post": post_dict}
 
 @app.get("/posts/{post_id}")
@@ -99,16 +99,16 @@ def get_post(post_id: int, db: Session = Depends(get_db)):
     cached_post = redis_client.get(f"post:{post_id}")
     if cached_post:
         return json.loads(cached_post)
-    
+
     # If not in cache, get from database
     post = db.query(BlogPost).filter(BlogPost.id == post_id).first()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    
+
     # Save to cache
     post_dict = post.to_dict()
     redis_client.setex(f"post:{post_id}", 3600, json.dumps(post_dict))  # Cache for 1 hour
-    
+
     return post_dict
 
 @app.get("/search/")
