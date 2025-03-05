@@ -78,6 +78,23 @@ async def startup_event():
         )
     print("Elasticsearch index created")
 
+@app.put("/posts/{post_id}")
+def update_post(post_id: int, title: str, content: str, author: str, db: Session = Depends(get_db)):
+    # Update post in PostgreSQL
+    post = db.query(BlogPost).filter(BlogPost.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    post.title = title
+    post.content = content
+    post.author = author
+    db.commit()
+    
+    # Update in Elasticsearch
+    post_dict = post.to_dict()
+    es.index(index="blog_posts", id=post.id, body=post_dict)
+    
+    return {"message": "Post updated successfully", "post": post_dict}
 # API Endpoints
 @app.post("/posts/", response_model=dict)
 def create_post(title: str, content: str, author: str, db: Session = Depends(get_db)):
