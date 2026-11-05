@@ -43,7 +43,7 @@ service that uses the schema it already ships**, not as adding unrelated product
 client ──HTTP──▶ FastAPI app (app/)
                    ├─ routers/posts   ──▶ services/posts ──▶ PostgreSQL (SQLAlchemy)
                    │                                     ├─▶ Elasticsearch (index/delete, refresh=wait_for)
-                   │                                     └─▶ Redis (invalidate post:{id})
+                   │                                     └─▶ Redis (write-through / tombstone post:{id})
                    ├─ routers/search  ──▶ search.py      ──▶ Elasticsearch (_search)
                    ├─ routers/tags    ──▶ services/tags  ──▶ PostgreSQL
                    └─ routers/health  ──▶ DB / ES / Redis pings
@@ -62,7 +62,7 @@ app/
   schemas.py       Pydantic v2 request/response models
   search.py        index name/mapping, ensure_index, index_post, delete_post,
                    build_search_query (pure), search_posts, reindex_all
-  cache.py         get/set/invalidate cached post (best effort)
+  cache.py         get / set-if-absent / write-through / tombstone (best effort)
   services/posts.py  create/get/list/update/patch/delete + tag sync
   services/tags.py   list/get/update tags with post counts
   routers/{posts,search,tags,health}.py
@@ -155,7 +155,7 @@ PostgreSQL is authoritative, so the ES write happens **inside** the DB transacti
 ```
 begin → mutate ORM objects → flush (ids/defaults assigned)
       → ES index/delete (refresh=wait_for)
-      → commit → invalidate Redis key
+      → commit → refresh Redis entry (write-through) or store a delete tombstone
 ```
 
 If the ES call fails the session is rolled back and the client gets `503`; nothing
@@ -209,7 +209,7 @@ file is loaded if present; `.env.example` documents the variables.
    `bool/multi_match/term/match_all`, sort, paging, highlight, `ping`), and
    `fakeredis.FakeRedis`. Dependencies are overridden on the FastAPI app.
    Coverage: every endpoint's happy path and error path, tag normalisation and
-   sync, cache read-through + invalidation, ES-failure rollback, lifespan
+   sync, cache read-through + write-through/tombstone rules, ES-failure rollback, lifespan
    tolerance when ES is down, `build_search_query` exact DSL, `/health` degraded.
 2. **Integration tests (opt-in)** — skipped unless `INTEGRATION_DATABASE_URL`,
    `INTEGRATION_ELASTICSEARCH_URL` and `INTEGRATION_REDIS_URL` are set. They run
