@@ -1,29 +1,31 @@
 # migrations/env.py
-from logging.config import fileConfig
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-from alembic import context
 import os
 import sys
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import engine_from_config, pool
 
 # this is the Alembic Config object
 config = context.config
 
-# Add the app directory to the Python path
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+# Make the application package importable regardless of the working directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import the SQLAlchemy models
-from main import Base
+from app.models import Base  # noqa: E402
 
-# Set the SQLAlchemy URL from environment if available
-sqlalchemy_url = os.getenv("DATABASE_URL", "postgresql://bloguser:blogpassword@postgres:5432/blogdb")
-config.set_main_option("sqlalchemy.url", sqlalchemy_url)
+# The database URL comes from the environment (falls back to alembic.ini)
+sqlalchemy_url = os.getenv("DATABASE_URL")
+if sqlalchemy_url:
+    config.set_main_option("sqlalchemy.url", sqlalchemy_url)
 
 # Interpret the config file for Python logging
-fileConfig(config.config_file_name)
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
 
-# Add your model's MetaData object here for 'autogenerate' support
+# Model metadata for 'autogenerate' support
 target_metadata = Base.metadata
+
 
 def run_migrations_offline():
     """Run migrations in 'offline' mode."""
@@ -38,6 +40,7 @@ def run_migrations_offline():
     with context.begin_transaction():
         context.run_migrations()
 
+
 def run_migrations_online():
     """Run migrations in 'online' mode."""
     connectable = engine_from_config(
@@ -47,12 +50,11 @@ def run_migrations_online():
     )
 
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection, target_metadata=target_metadata
-        )
+        context.configure(connection=connection, target_metadata=target_metadata)
 
         with context.begin_transaction():
             context.run_migrations()
+
 
 if context.is_offline_mode():
     run_migrations_offline()
