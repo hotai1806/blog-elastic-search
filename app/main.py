@@ -1,11 +1,15 @@
 """FastAPI application factory and lifespan."""
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import search
@@ -21,6 +25,13 @@ Create, read, update and delete blog posts stored in PostgreSQL, search them wit
 Elasticsearch (relevance ranking, highlighting, author/tag filters) and serve single
 posts from a Redis cache.
 """
+
+
+class SafeJSONResponse(JSONResponse):
+    """JSON rendering that cannot fail on lone surrogates echoed back from client input."""
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(content, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("utf-8")
 
 
 @asynccontextmanager
@@ -59,6 +70,12 @@ def create_app() -> FastAPI:
     app.include_router(search_router.router)
     app.include_router(tags.router)
     app.include_router(health.router)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # Same body as FastAPI's default handler, rendered so that invalid input (e.g. a lone
+        # UTF-16 surrogate in a JSON string) is reported as 422 instead of crashing with 500.
+        return SafeJSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
     @app.exception_handler(search.SearchBackendError)
     async def search_backend_unavailable(_: Request, exc: search.SearchBackendError) -> JSONResponse:

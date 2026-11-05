@@ -9,7 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from app import search
 from app.config import settings
 from app.deps import get_es
-from app.routers.posts import PageParam, SizeParam, TagFilterParam, page_count, tag_filters
+from app.routers.posts import AuthorFilterParam, PageParam, SizeParam, TagFilterParam, page_count, tag_filters
 from app.schemas import SearchHit, SearchResponse, SortOption
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -35,7 +35,7 @@ def search_posts(
         Optional[str],
         Query(max_length=500, description="Full-text query over title (boosted) and content; omit to browse"),
     ] = None,
-    author: Annotated[Optional[str], Query(min_length=1, max_length=100, description="Exact author")] = None,
+    author: AuthorFilterParam = None,
     tag: TagFilterParam = [],
     sort: Annotated[SortOption, Query(description="relevance (default; falls back to newest without a query), newest or oldest")] = "relevance",
     page: PageParam = 1,

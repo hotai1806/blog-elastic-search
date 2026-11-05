@@ -238,3 +238,11 @@ timestamp column types.
   search results; migration `003` hardened for NULL `created_at`; `exec uvicorn` for
   signal handling; longer Elasticsearch health start periods; bounded `/health` pings;
   Alembic URL precedence and `disable_existing_loggers=False`.
+- **2026-11-05, final review round** (live Elasticsearch, API contract, tests/ops/docs
+  lenses; 10 findings upheld): NUL characters rejected at the API boundary; upper bound on
+  `page`; safe rendering of validation errors containing lone surrogates; string-typed
+  Elasticsearch error bodies translated to 503; searches create a missing index instead of
+  answering 503 forever; `unmapped_type` on sort clauses and a `_doc` tiebreaker in the
+  reconciliation scan; `%` escaped in the Alembic URL; bounded PostgreSQL connect timeout;
+  readiness waits derived from the configured URLs; blank tag descriptions clear the field;
+  the row-lock integration test drives the HTTP endpoints.

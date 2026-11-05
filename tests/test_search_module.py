@@ -180,3 +180,32 @@ def test_search_posts_accepts_legacy_integer_total(monkeypatch):
     monkeypatch.setattr(es, "search", lambda **_: {"hits": {"total": 3, "hits": []}})
     hits, total = search.search_posts(es, INDEX, query=None, author=None, tags=[], sort="newest", page=1, size=10)
     assert (hits, total) == ([], 3)
+
+
+def test_string_error_bodies_are_translated_not_crashed():
+    from elasticsearch import ApiError
+    from tests.fakes import _meta
+
+    exc = ApiError(message="gateway", meta=_meta(503), body={"error": "upstream request timeout", "status": 503})
+    assert "upstream request timeout" in search._describe(exc)
+    with pytest.raises(search.SearchBackendError, match="upstream request timeout"):
+        with search._translate_errors():
+            raise exc
+    assert search._describe(ApiError(message="x", meta=_meta(500), body=None)) == "ApiError(500, 'x')"
+
+
+def test_search_creates_a_missing_index_instead_of_failing():
+    es = FakeElasticsearch()
+    hits, total = search.search_posts(es, INDEX, query="anything", author=None, tags=[], sort="relevance", page=1, size=10)
+    assert (hits, total) == ([], 0)
+    assert search.mapping_problems(es, INDEX) == []
+
+
+def test_reconciliation_scan_breaks_ties_with_doc_order(monkeypatch):
+    """Documents without an ``id`` all sort equal; the _doc tiebreaker keeps paging going."""
+    monkeypatch.setattr(search, "SCAN_PAGE_SIZE", 2)
+    es = FakeElasticsearch()
+    search.ensure_index(es, INDEX)
+    for n in range(5):
+        es.put_raw_document(INDEX, f"legacy-{n}", {"title": "no id field"})
+    assert sorted(search.stale_document_ids(es, INDEX, keep_ids=set())) == [f"legacy-{n}" for n in range(5)]

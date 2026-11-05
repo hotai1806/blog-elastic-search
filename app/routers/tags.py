@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Tag
-from app.schemas import TagOut, TagPatch, TagSortOption
+from app.schemas import NO_NUL, TagOut, TagPatch, TagSortOption
 from app.services import tags as tags_service
 
 router = APIRouter(prefix="/tags", tags=["tags"])
@@ -38,14 +38,17 @@ def list_tags(
     return [tag_out(tag, count) for tag, count in tags_service.list_tags(db, sort=sort)]
 
 
+TagNameParam = Annotated[str, Path(pattern=NO_NUL, description="Tag name (normalised like every other tag input)")]
+
+
 @router.get("/{name}", response_model=TagOut)
-def get_tag(name: str, db: Session = Depends(get_db)) -> TagOut:
+def get_tag(name: TagNameParam, db: Session = Depends(get_db)) -> TagOut:
     tag, count = load_tag_or_404(db, name)
     return tag_out(tag, count)
 
 
 @router.patch("/{name}", response_model=TagOut)
-def update_tag(name: str, data: TagPatch, db: Session = Depends(get_db)) -> TagOut:
+def update_tag(name: TagNameParam, data: TagPatch, db: Session = Depends(get_db)) -> TagOut:
     tag, count = load_tag_or_404(db, name)
     tag = tags_service.update_tag(db, tag, data)
     return tag_out(tag, count)

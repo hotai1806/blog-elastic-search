@@ -57,9 +57,19 @@ def _mark_verified(es: Any, index: str) -> None:
 
 
 def _describe(exc: Exception) -> str:
-    """``str(exc)`` plus Elasticsearch's own reason when the response carries one."""
+    """``str(exc)`` plus Elasticsearch's own reason when the response carries one.
+
+    ``error`` is usually an object but can be a plain string (some REST-layer errors and
+    JSON-speaking proxies), which the client itself also tolerates.
+    """
     body = getattr(exc, "body", None)
-    reason = body.get("error", {}).get("reason") if isinstance(body, dict) else None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        reason = error.get("reason")
+    elif isinstance(error, str):
+        reason = error
+    else:
+        reason = None
     return f"{exc}: {reason}" if reason else str(exc)
 
 
@@ -248,7 +258,7 @@ def stale_document_ids(es: Elasticsearch, index: str, keep_ids: Iterable[Any]) -
         kwargs: dict[str, Any] = {
             "index": index,
             "query": {"match_all": {}},
-            "sort": [{"id": {"order": "asc", "unmapped_type": "long"}}],
+            "sort": [{"id": {"order": "asc", "unmapped_type": "long"}}, "_doc"],
             "size": SCAN_PAGE_SIZE,
             "source": False,
             "track_total_hits": False,
@@ -317,10 +327,14 @@ def build_search_query(
         bool_query["filter"] = filters
 
     effective_sort = "newest" if sort == "relevance" and not query else sort
+    # unmapped_type keeps searches working against an index created by an older version
+    # (no ``id`` field) until it has been upgraded.
+    created_at = lambda order: {"created_at": {"order": order, "unmapped_type": "date"}}  # noqa: E731
+    post_id = lambda order: {"id": {"order": order, "unmapped_type": "long"}}  # noqa: E731
     sort_clause = {
-        "relevance": [{"_score": {"order": "desc"}}, {"created_at": {"order": "desc"}}, {"id": {"order": "desc"}}],
-        "newest": [{"created_at": {"order": "desc"}}, {"id": {"order": "desc"}}],
-        "oldest": [{"created_at": {"order": "asc"}}, {"id": {"order": "asc"}}],
+        "relevance": [{"_score": {"order": "desc"}}, created_at("desc"), post_id("desc")],
+        "newest": [created_at("desc"), post_id("desc")],
+        "oldest": [created_at("asc"), post_id("asc")],
     }[effective_sort]
 
     params: dict[str, Any] = {
@@ -353,6 +367,7 @@ def search_posts(
 ) -> tuple[list[dict[str, Any]], int]:
     """Run a search and return ``(hits, total)``; each hit is the document plus ``score``/``highlights``."""
     params = build_search_query(query=query, author=author, tags=tags, sort=sort, page=page, size=size)
+    _ensure_verified(es, index)  # a missing index yields no results instead of a 404 -> 503
     with _translate_errors():
         response = _body(es.search(index=index, **params))
     hits_section = response["hits"]

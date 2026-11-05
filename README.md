@@ -66,7 +66,7 @@ and return `total` and `pages`. Timestamps are ISO 8601 in UTC (no offset suffix
 | `GET` | `/search/` | `query`, `author`, `tag` (repeatable, AND), `sort`, `page`, `size` | `{results, total, page, size, pages, query}` |
 | `GET` | `/tags/` | `sort=name` (default) or `sort=posts` | `[{id, name, description, created_at, post_count}]` |
 | `GET` | `/tags/{name}` | — | tag |
-| `PATCH` | `/tags/{name}` | `{description}` (`null` clears it) | tag |
+| `PATCH` | `/tags/{name}` | `{description}` (`null` or blank clears it) | tag |
 | `GET` | `/health` | — | `200` or `503` with per-service status |
 
 A post looks like:
@@ -92,7 +92,9 @@ cannot be reached, writes and searches answer `503` (see below).
 
 Tag names are normalised on every input (request bodies, `tag=` filters and `/tags/{name}`):
 trimmed, internal whitespace collapsed, lower-cased and de-duplicated, so `"Machine  Learning"`
-and `"machine learning"` are the same tag. A blank tag is rejected with `422` everywhere.
+and `"machine learning"` are the same tag. A blank tag in a request body or a `tag=` filter is
+rejected with `422`; `/tags/{name}` answers `404` for a blank or unknown name. Strings may not
+contain NUL characters (`422`).
 On both `GET /posts/` and `GET /search/` the `tag` parameter can be repeated
 (`?tag=python&tag=search`) and every listed tag is required. Tags are created on first use, keep their
 `description` and stay listed (with `post_count: 0`) after the last post using them is
@@ -137,10 +139,12 @@ e.g. `{"title": ["Searching blogs with <em>Elasticsearch</em>"], "content": [...
   both could leave the earlier value until the TTL expires.
 - **Startup never blocks on Elasticsearch.** The app creates the index if it is missing; if
   Elasticsearch is unreachable it logs a warning and keeps serving the database-backed
-  endpoints (search and post writes return `503` until it is back). If the live index has an
-  outdated mapping the log says so; `python migrate.py --init` (or `--sync`) upgrades it.
-- `GET /health` pings all three services (with short timeouts) and returns `503` with
-  `status: "degraded"` when any of them fails.
+  endpoints, while searches and post writes return `503`. Once Elasticsearch is back, the
+  next search or write creates the index with the explicit mapping; posts written before
+  that are indexed by `python migrate.py --init` (or `--sync`). If the live index has an
+  outdated mapping the log says so; `--init` upgrades it.
+- `GET /health` pings all three services with short timeouts (it does not check that the
+  index exists) and returns `503` with `status: "degraded"` when any of them fails.
 
 ## Database migrations and the maintenance CLI
 
@@ -180,7 +184,7 @@ This version changes the HTTP contract and the search mapping:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `DATABASE_URL` | `postgresql://bloguser:blogpassword@postgres:5432/blogdb` | SQLAlchemy/psycopg2 URL |
+| `DATABASE_URL` | `postgresql://bloguser:blogpassword@postgres:5432/blogdb` | SQLAlchemy/psycopg2 URL (URL-encode special characters in the password, e.g. `p%40ss`) |
 | `ELASTICSEARCH_URL` | `http://elasticsearch:9200` | Elasticsearch endpoint |
 | `ELASTICSEARCH_INDEX` | `blog_posts` | Index name |
 | `REDIS_URL` | `redis://redis:6379` | Redis endpoint |

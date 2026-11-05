@@ -295,3 +295,39 @@ def test_first_write_creates_a_missing_index_with_the_mapping(client, fake_es):
     make_post(client, author="Jane Doe", tags=["machine learning"])
     assert fake_es.indices.get_mapping(index=INDEX)[INDEX]["mappings"] == search.INDEX_MAPPINGS
     assert search.mapping_problems(fake_es, INDEX) == []
+
+
+def test_list_posts_rejects_pages_beyond_the_limit(client):
+    assert client.get("/posts/", params={"page": 10**18}).status_code == 422
+    assert client.get("/posts/", params={"page": 1_000_000, "size": 100}).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "method, path, kwargs",
+    [
+        ("post", "/posts/", {"json": {"title": "nul\u0000title", "content": "c", "author": "a"}}),
+        ("post", "/posts/", {"json": {"title": "t", "content": "c\u0000", "author": "a"}}),
+        ("post", "/posts/", {"json": {"title": "t", "content": "c", "author": "a", "tags": ["x\u0000y"]}}),
+        ("patch", "/posts/1", {"json": {"author": "a\u0000"}}),
+        ("put", "/posts/1", {"json": {"title": "t\u0000", "content": "c", "author": "a"}}),
+        ("get", "/posts/", {"params": {"author": "a\x00b"}}),
+        ("get", "/posts/", {"params": {"tag": "\x00a"}}),
+        ("get", "/search/", {"params": {"author": "a\x00b"}}),
+        ("get", "/search/", {"params": {"tag": "\x00a"}}),
+    ],
+)
+def test_nul_characters_are_rejected_with_422(client, method, path, kwargs):
+    make_post(client)
+    response = getattr(client, method)(path, **kwargs)
+    assert response.status_code == 422, response.text
+    assert isinstance(response.json()["detail"], list)
+
+
+def test_lone_surrogate_in_json_body_is_a_422_not_a_500(client):
+    response = client.post(
+        "/posts/",
+        content=b'{"title":"sur\\ud800rogate","content":"c","author":"a"}',
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "title"]

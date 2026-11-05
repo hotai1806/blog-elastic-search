@@ -18,7 +18,9 @@ from app.models import Base  # noqa: E402
 # the integration tests) > DATABASE_URL environment variable > alembic.ini
 sqlalchemy_url = config.attributes.get("database_url") or os.getenv("DATABASE_URL")
 if sqlalchemy_url:
-    config.set_main_option("sqlalchemy.url", sqlalchemy_url)
+    # Main options go through ConfigParser interpolation: a URL-encoded password such as
+    # p%40ss must be escaped or Alembic raises "invalid interpolation syntax".
+    config.set_main_option("sqlalchemy.url", sqlalchemy_url.replace("%", "%%"))
 
 # Interpret the config file for Python logging without disabling the application's loggers
 # (migrations run in-process from migrate.py and the tests)

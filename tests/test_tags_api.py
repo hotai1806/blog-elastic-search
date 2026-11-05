@@ -59,3 +59,19 @@ def test_tags_survive_post_deletion_with_zero_count(client):
     client.delete("/posts/1")
     tag = client.get("/tags/python").json()
     assert (tag["post_count"], tag["description"]) == (0, "kept")
+
+
+def test_tag_paths_and_descriptions_reject_nul(client):
+    make_post(client, tags=["python"])
+    assert client.get("/tags/a%00b").status_code == 422
+    assert client.patch("/tags/python", json={"description": "x\u0000y"}).status_code == 422
+
+
+def test_blank_description_clears_it(client):
+    make_post(client, tags=["python"])
+    client.patch("/tags/python", json={"description": "kept"})
+    assert client.patch("/tags/python", json={"description": "   "}).json()["description"] is None
+
+
+def test_blank_tag_name_in_path_is_not_found(client):
+    assert client.get("/tags/%20%20").status_code == 404

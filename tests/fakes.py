@@ -321,29 +321,39 @@ class FakeElasticsearch:
                 matched.append([score, doc, doc_id])
 
         clauses = sort or [{"_score": {"order": "desc"}}]
-        for clause in reversed(clauses):
+        doc_order = {doc_id: position for position, doc_id in enumerate(self._store[index]["docs"])}
+
+        def parse_clause(clause: Any) -> tuple[str, str]:
+            if isinstance(clause, str):  # e.g. "_doc"
+                return clause, "asc"
             ((field, spec),) = clause.items()
-            order = spec.get("order", "asc") if isinstance(spec, dict) else spec
+            return field, (spec.get("order", "asc") if isinstance(spec, dict) else spec)
+
+        def value_of(item: list[Any], field: str) -> Any:
             if field == "_score":
-                matched.sort(key=lambda item: item[0], reverse=(order == "desc"))
-            else:
-                matched.sort(key=lambda item, f=field: _sort_key(item[1].get(f)), reverse=(order == "desc"))
-        scored = any("_score" in clause for clause in clauses)
+                return item[0]
+            if field == "_doc":
+                return doc_order[item[2]]
+            return item[1].get(field)
+
+        for clause in reversed(clauses):
+            field, order = parse_clause(clause)
+            matched.sort(key=lambda item, f=field: _sort_key(value_of(item, f)), reverse=(order == "desc"))
+        scored = any(parse_clause(clause)[0] == "_score" for clause in clauses)
 
         def sort_values(item: list[Any]) -> list[Any]:
-            values = []
-            for clause in clauses:
-                ((field, _spec),) = clause.items()
-                values.append(item[0] if field == "_score" else item[1].get(field))
-            return values
+            return [value_of(item, parse_clause(clause)[0]) for clause in clauses]
 
         if search_after is not None:
-            ((_first_field, first_spec),) = clauses[0].items()
-            order = first_spec.get("order", "asc") if isinstance(first_spec, dict) else first_spec
+            orders = [parse_clause(clause)[1] for clause in clauses]
 
             def after(item: list[Any]) -> bool:
-                value = sort_values(item)[0]
-                return value > search_after[0] if order == "asc" else value < search_after[0]
+                # lexicographic comparison of the full sort tuple, honouring each key's order
+                for value, limit, order in zip(sort_values(item), search_after, orders):
+                    if _sort_key(value) == _sort_key(limit):
+                        continue
+                    return _sort_key(value) > _sort_key(limit) if order == "asc" else _sort_key(value) < _sort_key(limit)
+                return False
 
             matched = [item for item in matched if after(item)]
 

@@ -18,7 +18,11 @@ def test_query_with_filters_builds_expected_dsl():
                 ],
             }
         },
-        "sort": [{"_score": {"order": "desc"}}, {"created_at": {"order": "desc"}}, {"id": {"order": "desc"}}],
+        "sort": [
+            {"_score": {"order": "desc"}},
+            {"created_at": {"order": "desc", "unmapped_type": "date"}},
+            {"id": {"order": "desc", "unmapped_type": "long"}},
+        ],
         "from_": 5,
         "size": 5,
         "track_total_hits": True,
@@ -34,20 +38,26 @@ def test_query_with_filters_builds_expected_dsl():
 def test_browse_without_query_uses_match_all_newest_and_no_highlight():
     params = build_search_query(query=None, author=None, tags=[], sort="relevance", page=1, size=10)
     assert params["query"] == {"bool": {"must": [{"match_all": {}}]}}
-    assert params["sort"] == [{"created_at": {"order": "desc"}}, {"id": {"order": "desc"}}]
+    assert params["sort"] == [
+        {"created_at": {"order": "desc", "unmapped_type": "date"}},
+        {"id": {"order": "desc", "unmapped_type": "long"}},
+    ]
     assert params["from_"] == 0
     assert "highlight" not in params
 
 
 def test_oldest_sort_and_offset():
     params = build_search_query(query="x", author=None, tags=[], sort="oldest", page=3, size=20)
-    assert params["sort"] == [{"created_at": {"order": "asc"}}, {"id": {"order": "asc"}}]
+    assert params["sort"] == [
+        {"created_at": {"order": "asc", "unmapped_type": "date"}},
+        {"id": {"order": "asc", "unmapped_type": "long"}},
+    ]
     assert params["from_"] == 40
 
 
 def test_newest_sort_with_query_keeps_highlight():
     params = build_search_query(query="x", author=None, tags=[], sort="newest", page=1, size=1)
-    assert params["sort"][0] == {"created_at": {"order": "desc"}}
+    assert params["sort"][0] == {"created_at": {"order": "desc", "unmapped_type": "date"}}
     assert "highlight" in params
 
 

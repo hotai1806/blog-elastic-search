@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 MAX_TAGS_PER_POST = 20
 MAX_TAG_LENGTH = 50
+# Strings may not contain NUL: PostgreSQL rejects it at execution time (which would be a 500).
+NO_NUL = r"^[^\x00]*$"
 
 SortOption = Literal["relevance", "newest", "oldest"]
 TagSortOption = Literal["name", "posts"]
@@ -26,6 +28,8 @@ def normalize_tags(raw: list[str]) -> list[str]:
         name = normalize_tag(item)
         if not name:
             raise ValueError("tag names must not be blank")
+        if "\x00" in name:
+            raise ValueError("tag names must not contain NUL characters")
         if len(name) > MAX_TAG_LENGTH:
             raise ValueError(f"tag names must be at most {MAX_TAG_LENGTH} characters")
         if name not in seen:
@@ -43,6 +47,8 @@ def parse_tag_filters(raw: list[str]) -> list[str]:
         name = normalize_tag(item)
         if not name:
             raise ValueError("tag must not be blank")
+        if "\x00" in name:
+            raise ValueError("tag must not contain NUL characters")
         if len(name) > MAX_TAG_LENGTH:
             raise ValueError(f"tag must be at most {MAX_TAG_LENGTH} characters")
         if name not in result:
@@ -53,9 +59,9 @@ def parse_tag_filters(raw: list[str]) -> list[str]:
 class PostCreate(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    title: str = Field(..., min_length=1, max_length=255, examples=["Searching blogs with Elasticsearch"])
-    content: str = Field(..., min_length=1, examples=["Full-text search made simple..."])
-    author: str = Field(..., min_length=1, max_length=100, examples=["tai"])
+    title: str = Field(..., min_length=1, max_length=255, pattern=NO_NUL, examples=["Searching blogs with Elasticsearch"])
+    content: str = Field(..., min_length=1, pattern=NO_NUL, examples=["Full-text search made simple..."])
+    author: str = Field(..., min_length=1, max_length=100, pattern=NO_NUL, examples=["tai"])
     tags: list[str] = Field(default_factory=list, examples=[["elasticsearch", "python"]])
 
     @field_validator("tags")
@@ -73,9 +79,9 @@ class PostPatch(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    title: Optional[str] = Field(None, min_length=1, max_length=255)
-    content: Optional[str] = Field(None, min_length=1)
-    author: Optional[str] = Field(None, min_length=1, max_length=100)
+    title: Optional[str] = Field(None, min_length=1, max_length=255, pattern=NO_NUL)
+    content: Optional[str] = Field(None, min_length=1, pattern=NO_NUL)
+    author: Optional[str] = Field(None, min_length=1, max_length=100, pattern=NO_NUL)
     tags: Optional[list[str]] = None
 
     @field_validator("tags")
@@ -143,9 +149,16 @@ class TagOut(BaseModel):
 
 
 class TagPatch(BaseModel):
+    """``description`` ``null`` or blank clears it."""
+
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    description: Optional[str] = Field(None, max_length=255)
+    description: Optional[str] = Field(None, max_length=255, pattern=NO_NUL)
+
+    @field_validator("description")
+    @classmethod
+    def _blank_clears(cls, value: Optional[str]) -> Optional[str]:
+        return value or None
 
 
 class HealthOut(BaseModel):

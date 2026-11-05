@@ -272,22 +272,39 @@ def test_upgrade_from_pre_alembic_database(engine, es_client):
 
 
 def test_write_endpoints_lock_the_row(client, session_factory):
+    """PUT/PATCH/DELETE wait for the row lock; readers and other posts are unaffected."""
     post = create(client, title="locked")
+    other_post = create(client, title="free")
+    url = f"/posts/{post['id']}"
+
+    def impatient_db():
+        session = session_factory()
+        session.execute(text("SET lock_timeout = '300ms'"))
+        try:
+            yield session
+        finally:
+            session.close()
+
     locker = session_factory()
     try:
         assert posts_service.get_post(locker, post["id"], for_update=True) is not None
-        with session_factory() as other:
-            other.execute(text("SET lock_timeout = '300ms'"))
-            with pytest.raises(OperationalError):
-                posts_service.get_post(other, post["id"], for_update=True)
-            other.rollback()
+        app.dependency_overrides[get_db] = impatient_db
+        for method, kwargs in [
+            ("put", {"json": {"title": "x", "content": "c", "author": "a"}}),
+            ("patch", {"json": {"title": "x"}}),
+            ("delete", {}),
+        ]:
+            with pytest.raises(OperationalError, match="lock timeout"):
+                getattr(client, method)(url, **kwargs)
+        assert client.get(url).status_code == 200  # reads do not need the lock
+        assert client.patch(f"/posts/{other_post['id']}", json={"title": "still free"}).status_code == 200
     finally:
         locker.rollback()
         locker.close()
-    # once the lock is released the second writer proceeds and sees the committed row
-    with session_factory() as other:
-        assert posts_service.get_post(other, post["id"], for_update=True).title == "locked"
-        other.rollback()
+    # once the lock is released the writers proceed and see the committed row
+    assert client.patch(url, json={"title": "after lock"}).status_code == 200
+    assert client.get(url).json()["title"] == "after lock"
+    assert client.delete(url).status_code == 204
 
 
 def test_list_posts_requires_every_tag(client):
@@ -345,3 +362,9 @@ def test_first_write_after_startup_without_index_uses_the_mapping(client, es_cli
     tagged = create(client, title="late", author="John Smith", tags=["machine learning"])
     assert search.mapping_problems(es_client, TEST_INDEX) == []
     assert ids(client.get("/search/", params={"author": "John Smith", "tag": "machine learning"})) == [tagged["id"]]
+
+
+def test_alembic_accepts_percent_encoded_database_urls(engine):
+    separator = "&" if "?" in DB_URL else "?"
+    cfg = migrate.alembic_config(f"{DB_URL}{separator}application_name=pct%41test")
+    command.current(cfg)  # would raise "invalid interpolation syntax" without escaping

@@ -14,13 +14,16 @@ from app.config import settings
 from app.database import get_db
 from app.deps import get_es, get_redis
 from app.models import BlogPost
-from app.schemas import PostCreate, PostList, PostOut, PostPatch, PostUpdate, parse_tag_filters
+from app.schemas import NO_NUL, PostCreate, PostList, PostOut, PostPatch, PostUpdate, parse_tag_filters
 from app.services import posts as posts_service
 
 router = APIRouter(prefix="/posts", tags=["posts"])
 
-PageParam = Annotated[int, Query(ge=1, description="1-based page number")]
+MAX_PAGE = 1_000_000  # keeps OFFSET far below PostgreSQL's bigint range
+
+PageParam = Annotated[int, Query(ge=1, le=MAX_PAGE, description="1-based page number")]
 SizeParam = Annotated[int, Query(ge=1, le=100, description="Items per page")]
+AuthorFilterParam = Annotated[Optional[str], Query(min_length=1, max_length=100, pattern=NO_NUL, description="Exact author")]
 TagFilterParam = Annotated[
     list[str],
     Query(description="Filter by tag; repeat the parameter to require every tag"),
@@ -62,7 +65,7 @@ def create_post(
 def list_posts(
     page: PageParam = 1,
     size: SizeParam = 10,
-    author: Annotated[Optional[str], Query(min_length=1, max_length=100)] = None,
+    author: AuthorFilterParam = None,
     tag: TagFilterParam = [],
     db: Session = Depends(get_db),
 ) -> PostList:
