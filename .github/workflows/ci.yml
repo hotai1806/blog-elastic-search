@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  integration:
+    name: Integration tests (PostgreSQL, Elasticsearch, Redis)
+    runs-on: ubuntu-latest
+    needs: unit
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: bloguser
+          POSTGRES_PASSWORD: blogpassword
+          POSTGRES_DB: blogdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bloguser -d blogdb"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl --silent --fail http://localhost:9200/_cluster/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      INTEGRATION_DATABASE_URL: postgresql://bloguser:blogpassword@localhost:5432/blogdb
+      INTEGRATION_ELASTICSEARCH_URL: http://localhost:9200
+      INTEGRATION_REDIS_URL: redis://localhost:6379/1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q -m integration tests/integration
