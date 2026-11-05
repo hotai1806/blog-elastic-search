@@ -6,7 +6,7 @@ write -> ``commit``. If Elasticsearch fails the session is rolled back and
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Optional
 
 from elasticsearch import Elasticsearch
@@ -64,8 +64,10 @@ def _write_through(db: Session, action: Callable[[], None]) -> None:
         raise
 
 
-def get_post(db: Session, post_id: int) -> Optional[BlogPost]:
-    return db.get(BlogPost, post_id)
+def get_post(db: Session, post_id: int, *, for_update: bool = False) -> Optional[BlogPost]:
+    """Load a post; ``for_update`` takes a row lock (``SELECT ... FOR UPDATE``) so concurrent
+    writers queue up and each sees the previous one's committed state."""
+    return db.get(BlogPost, post_id, with_for_update=True if for_update else None)
 
 
 def list_posts(
@@ -74,13 +76,13 @@ def list_posts(
     page: int,
     size: int,
     author: Optional[str] = None,
-    tag: Optional[str] = None,
+    tags: Sequence[str] = (),
 ) -> tuple[list[BlogPost], int]:
-    """Newest-first page of posts with optional exact-match filters; returns ``(items, total)``."""
+    """Newest-first page of posts filtered by exact author and/or by every tag in ``tags``."""
     stmt = select(BlogPost)
     if author:
         stmt = stmt.where(BlogPost.author == author)
-    if tag:
+    for tag in tags:
         stmt = stmt.where(BlogPost.tag_relations.any(Tag.name == tag))
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     items = db.scalars(

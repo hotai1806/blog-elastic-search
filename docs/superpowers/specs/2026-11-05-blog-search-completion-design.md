@@ -92,8 +92,10 @@ Top-level `models.py` is removed (moved to `app/models.py`).
 - `001`: unchanged semantics; the deprecated `Inspector.from_engine` call becomes
   `sa.inspect(bind)` and index creation is made idempotent.
 - `002`: unchanged.
-- `003_add_updated_at_to_posts`: adds `blog_posts.updated_at TIMESTAMP NOT NULL
-  DEFAULT now()`; downgrade drops it.
+- `003_add_updated_at_to_posts`: backfills NULL `created_at` values (possible on
+  pre-Alembic tables) and makes the column `NOT NULL DEFAULT now()`, then adds
+  `blog_posts.updated_at TIMESTAMP NOT NULL DEFAULT now()` backfilled from `created_at`;
+  downgrade drops `updated_at`.
 
 ### 3.4 API
 
@@ -102,7 +104,7 @@ All list endpoints are 1-based `page` (default 1) with `size` 1–100 (default 1
 | Method | Path | Body / params | Response |
 |--------|------|---------------|----------|
 | POST | `/posts/` | `PostCreate {title, content, author, tags?}` | `201 PostOut` |
-| GET | `/posts/` | `page, size, author?, tag?` (newest first) | `PostList {items, total, page, size, pages}` |
+| GET | `/posts/` | `page, size, author?, tag*` (repeatable, AND; newest first) | `PostList {items, total, page, size, pages}` |
 | GET | `/posts/{id}` | — | `PostOut` (served from Redis when cached) |
 | PUT | `/posts/{id}` | `PostUpdate` (all fields; `tags` omitted ⇒ `[]`) | `PostOut` |
 | PATCH | `/posts/{id}` | `PostPatch` (any subset; `tags` present ⇒ replaced) | `PostOut` |
@@ -117,7 +119,8 @@ All list endpoints are 1-based `page` (default 1) with `size` 1–100 (default 1
 - `query` is optional on `/search/`: without it the endpoint browses by filters
   (sorted newest unless told otherwise); `sort=relevance` without `query` falls back
   to `newest`. `page*size` beyond 10 000 hits is rejected with `422` (ES result window).
-- Validation errors are FastAPI's default `422`. Unknown post/tag ⇒ `404`.
+- Validation errors are FastAPI's default `422` body (`detail` is a list), including the
+  result-window check and a blank `tag` filter value. Unknown post/tag ⇒ `404`.
 - The hand-rolled `/docs` route is deleted; FastAPI's built-in `/docs`, `/redoc`
   and `/openapi.json` carry the title/version/description.
 
@@ -137,6 +140,13 @@ All list endpoints are 1-based `page` (default 1) with `size` 1–100 (default 1
     oldest ⇒ `created_at asc`;
   - highlight on `title` and `content`.
 - Failures (`elasticsearch.ApiError`, `elasticsearch.TransportError`) map to `503`.
+- Writes never rely on Elasticsearch's auto-create: the first write of a process verifies
+  (and if needed creates) the index with the explicit mapping, memoised per client.
+  `ensure_index` treats a concurrent `resource_already_exists_exception` as success.
+- `prepare_index` (used by `migrate.py`) adds missing fields with `put_mapping` and
+  rebuilds the index when a field's type conflicts (Elasticsearch cannot change types).
+- `SearchHit` tolerates documents indexed by the previous version (no `updated_at`,
+  no `tags`) so search keeps working until they are re-indexed.
 
 ### 3.6 Write-path consistency
 
@@ -149,13 +159,18 @@ begin → mutate ORM objects → flush (ids/defaults assigned)
 ```
 
 If the ES call fails the session is rolled back and the client gets `503`; nothing
-is persisted. If the commit itself fails after a successful ES write, the stale ES
-document is repaired by `python migrate.py --sync` (documented).
+is persisted. Update and delete endpoints load the row with `SELECT … FOR UPDATE`, so
+concurrent writers to one post are serialised and each re-indexes the state it commits
+(and the tags ARRAY column cannot drift from `post_tags`). If the commit itself fails
+after a successful ES write, `python migrate.py --sync` reconciles the index: it re-indexes
+every row and deletes documents whose row does not exist.
 
 ### 3.7 Cache (`app/cache.py`)
 
 - Key `post:{id}`, value = `PostOut` JSON, TTL `CACHE_TTL_SECONDS` (default 3600).
-- `GET /posts/{id}` reads through; `PUT/PATCH/DELETE` invalidate after commit.
+- `GET /posts/{id}` reads through and fills the cache only if the key is absent (`SET NX`);
+  `PUT/PATCH` write the fresh post through after commit; `DELETE` stores a tombstone for the
+  cache lifetime. A slow reader therefore cannot re-populate a stale or deleted post.
 - Every Redis error is caught and logged; the request proceeds against the DB.
 
 ### 3.8 `migrate.py`
@@ -163,11 +178,14 @@ document is repaired by `python migrate.py --sync` (documented).
 | Flag | Action |
 |------|--------|
 | (none) | Alembic `upgrade head` |
-| `--init` | upgrade + ensure ES index exists |
-| `--sync` | bulk re-index every post from PostgreSQL (`elasticsearch.helpers.bulk`) |
-| `--reset-index` | delete the index, recreate with the current mapping, then `--sync` |
+| `--init` | upgrade; create the index or upgrade its mapping (`prepare_index`); full re-index |
+| `--sync` | `prepare_index`; chunked `bulk` re-index of every post; delete documents with no row |
+| `--reset-index` | delete the index, recreate with the current mapping, then re-index |
 
-Alembic is invoked through its Python API (`alembic.command.upgrade`), not a subprocess.
+Alembic is invoked through its Python API (`alembic.command.upgrade`) with the database URL
+passed via `config.attributes["database_url"]` (precedence: programmatic > `DATABASE_URL` >
+`alembic.ini`), not a subprocess. `--sync`/`--reset-index` are documented to run while the
+app is not taking writes.
 
 ### 3.9 Configuration
 
@@ -207,3 +225,16 @@ file is loaded if present; `.env.example` documents the variables.
 Authentication, pagination of `/tags/`, deleting tags, search-result caching,
 async database drivers, Elasticsearch aliases/zero-downtime reindex, changing
 timestamp column types.
+
+## 6. Revision history
+
+- **2026-11-05, after review.** A three-lens design critique (35 issues, 11 verified
+  before the session's usage limit hit) and a two-lens code review (8 findings, all
+  reproduced against live services) led to: lazy, mapping-safe index creation on the
+  write path and mapping upgrade/rebuild in `migrate.py`; row locks on update/delete;
+  race-free cache rules (`SET NX` reads, write-through updates, delete tombstones);
+  reconciliation of orphan documents in `--sync`; repeatable `tag` on `GET /posts/`;
+  blank `tag` filters rejected with FastAPI's `422` shape; legacy-document tolerance in
+  search results; migration `003` hardened for NULL `created_at`; `exec uvicorn` for
+  signal handling; longer Elasticsearch health start periods; bounded `/health` pings;
+  Alembic URL precedence and `disable_existing_loggers=False`.

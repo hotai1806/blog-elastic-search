@@ -18,4 +18,4 @@ RUN chmod +x /app/run_migrations.sh
 EXPOSE 8000
 
 # Run migrations and then start the application
-CMD ["sh", "-c", "./run_migrations.sh && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "./run_migrations.sh && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]

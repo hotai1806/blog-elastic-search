@@ -1,11 +1,14 @@
+import json
 from datetime import datetime
 
 import pytest
 from sqlalchemy import select
 
+from app import cache
 from app.models import BlogPost, Tag
 from app.services import posts as posts_service
-from app.schemas import PostCreate
+from app import search
+from app.schemas import PostCreate, PostOut
 from tests.conftest import INDEX, make_post
 
 
@@ -105,6 +108,20 @@ def test_list_posts_filters_by_author_and_normalised_tag(client):
     both = client.get("/posts/", params={"author": "bob", "tag": "go"}).json()
     assert [p["title"] for p in both["items"]] == ["B"]
 
+    every = client.get("/posts/", params={"tag": ["python", "GO"]}).json()
+    assert [p["title"] for p in every["items"]] == ["B"]
+    assert every["total"] == 1
+
+
+def test_list_posts_rejects_blank_or_overlong_tag(client):
+    make_post(client)
+    response = client.get("/posts/", params={"tag": " "})
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["query", "tag"]
+    assert "blank" in error["msg"]
+    assert client.get("/posts/", params={"tag": "x" * 51}).status_code == 422
+
 
 def test_list_posts_empty(client):
     assert client.get("/posts/").json() == {"items": [], "total": 0, "page": 1, "size": 10, "pages": 0}
@@ -127,7 +144,7 @@ def test_put_replaces_everything_and_clears_omitted_tags(client, fake_es, fake_r
     assert body["created_at"] == created["created_at"]
     assert body["updated_at"] > created["updated_at"]
 
-    assert fake_redis.exists("post:1") == 0
+    assert json.loads(fake_redis.get("post:1")) == body  # written through
     assert fake_es.get_document(INDEX, 1)["title"] == "New"
     assert fake_es.get_document(INDEX, 1)["tags"] == []
     assert client.get("/posts/1").json() == body
@@ -155,7 +172,7 @@ def test_patch_updates_only_given_fields(client, fake_es, fake_redis):
     assert body["content"] == created["content"]
     assert body["tags"] == ["python"]
     assert body["updated_at"] > created["updated_at"]
-    assert fake_redis.exists("post:1") == 0
+    assert json.loads(fake_redis.get("post:1"))["title"] == "Patched"
     assert fake_es.get_document(INDEX, 1)["title"] == "Patched"
 
 
@@ -191,7 +208,7 @@ def test_delete_post_removes_everything(client, fake_es, fake_redis, db):
     assert db.get(BlogPost, 1) is None
     assert fake_es.get_document(INDEX, 1) is None
     assert fake_es.calls_named("delete")[-1]["refresh"] == "wait_for"
-    assert fake_redis.exists("post:1") == 0
+    assert fake_redis.get("post:1") == cache.TOMBSTONE
     assert client.delete("/posts/1").status_code == 404
     assert client.get("/tags/python").json()["post_count"] == 0
 
@@ -248,3 +265,33 @@ def test_concurrent_tag_creation_is_tolerated(db, session_factory, fake_es, monk
     assert post.tags == ["race", "other"]
     assert [tag.name for tag in db.scalars(select(Tag).order_by(Tag.name))] == ["other", "race"]
     assert db.get(BlogPost, post.id) is not None
+
+
+def test_slow_reader_cannot_resurrect_a_deleted_post(client, fake_redis, db):
+    """A GET that read the row just before a DELETE must not re-populate the cache."""
+    make_post(client)
+    snapshot = PostOut.model_validate(db.get(BlogPost, 1))
+    db.close()
+    assert client.delete("/posts/1").status_code == 204
+    # ...the slow reader now finishes and tries to cache what it read
+    cache.cache_post(fake_redis, snapshot, 3600, only_if_absent=True)
+    assert client.get("/posts/1").status_code == 404
+    assert fake_redis.get("post:1") == cache.TOMBSTONE
+
+
+def test_slow_reader_cannot_overwrite_a_newer_update(client, fake_redis, db):
+    make_post(client, title="Original")
+    snapshot = PostOut.model_validate(db.get(BlogPost, 1))
+    db.close()
+    client.put("/posts/1", json={"title": "Updated", "content": "c", "author": "a"})
+    cache.cache_post(fake_redis, snapshot, 3600, only_if_absent=True)
+    assert client.get("/posts/1").json()["title"] == "Updated"
+
+
+def test_first_write_creates_a_missing_index_with_the_mapping(client, fake_es):
+    """Startup could not create the index (Elasticsearch was down): the first write must."""
+    fake_es.indices.delete(index=INDEX)
+    search.forget_verified_indexes()
+    make_post(client, author="Jane Doe", tags=["machine learning"])
+    assert fake_es.indices.get_mapping(index=INDEX)[INDEX]["mappings"] == search.INDEX_MAPPINGS
+    assert search.mapping_problems(fake_es, INDEX) == []

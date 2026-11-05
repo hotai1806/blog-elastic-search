@@ -32,22 +32,50 @@ def test_default_runs_migrations_only(cli, fake_es):
     assert fake_es.documents(settings.elasticsearch_index) == {}
 
 
-def test_init_migrates_and_creates_index(cli, capsys):
+def test_init_migrates_creates_the_index_and_syncs(cli, monkeypatch, capsys):
     es = FakeElasticsearch()
-    migrate.get_es_client = lambda: es  # noqa: E731 - patched for this test only
+    monkeypatch.setattr(migrate, "get_es_client", lambda: es)
     assert migrate.main(["--init"]) == 0
     assert cli == ["migrate"]
-    assert es.indices.exists(index=settings.elasticsearch_index)
-    assert "created." in capsys.readouterr().out
+    assert search.mapping_problems(es, settings.elasticsearch_index) == []
+    assert sorted(es.documents(settings.elasticsearch_index)) == ["1", "2"]
+    out = capsys.readouterr().out
+    assert "created." in out and "Successfully synced 2 posts" in out
 
 
-def test_sync_indexes_every_post(cli, fake_es, capsys):
+def test_init_upgrades_an_outdated_mapping_in_place(cli, fake_es, capsys):
+    index = settings.elasticsearch_index
+    search.delete_index(fake_es, index)
+    fake_es.indices.create(index=index, mappings={"properties": {"title": {"type": "text"}, "author": {"type": "keyword"}}})
+    assert migrate.main(["--init"]) == 0
+    assert search.mapping_problems(fake_es, index) == []
+    assert "mapping extended" in capsys.readouterr().out
+
+
+def test_sync_indexes_every_post_and_removes_stale_documents(cli, fake_es, capsys):
+    fake_es.put_raw_document(settings.elasticsearch_index, 99, {"id": 99, "title": "ghost"})
     assert migrate.main(["--sync"]) == 0
     assert cli == []
     docs = fake_es.documents(settings.elasticsearch_index)
     assert sorted(docs) == ["1", "2"]
     assert docs["2"]["tags"] == []
-    assert "Successfully synced 2 posts" in capsys.readouterr().out
+    assert "Successfully synced 2 posts to Elasticsearch (1 stale document(s) removed)." in capsys.readouterr().out
+
+
+def test_sync_rebuilds_an_incompatible_mapping(cli, fake_es, capsys):
+    index = settings.elasticsearch_index
+    search.delete_index(fake_es, index)
+    fake_es.indices.create(index=index, mappings={"properties": {"tags": {"type": "text"}}})
+    assert migrate.main(["--sync"]) == 0
+    assert search.mapping_problems(fake_es, index) == []
+    assert sorted(fake_es.documents(index)) == ["1", "2"]
+
+
+def test_run_migrations_passes_the_database_url_to_alembic(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(migrate.command, "upgrade", lambda cfg, rev: captured.update(url=cfg.attributes["database_url"], rev=rev))
+    migrate.run_migrations("postgresql://example/db")
+    assert captured == {"url": "postgresql://example/db", "rev": "head"}
 
 
 def test_reset_index_drops_recreates_and_syncs(cli, fake_es, capsys):
@@ -57,8 +85,7 @@ def test_reset_index_drops_recreates_and_syncs(cli, fake_es, capsys):
     docs = fake_es.documents(stale)
     assert sorted(docs) == ["1", "2"]
     assert search.mapping_problems(fake_es, stale) == []
-    out = capsys.readouterr().out
-    assert "Deleted" in out and "Recreated" in out
+    assert "Recreated" in capsys.readouterr().out
 
 
 def test_elasticsearch_errors_exit_nonzero(cli, fake_es, capsys):

@@ -81,8 +81,77 @@ def test_reindex_posts_raises_on_item_errors(monkeypatch):
         es, "bulk",
         lambda operations, **_: {"errors": True, "items": [{"index": {"_id": "1", "status": 400, "error": {"reason": "bad"}}}]},
     )
-    with pytest.raises(search.SearchBackendError, match="1 document"):
+    with pytest.raises(search.SearchBackendError, match="1 bulk operation"):
         search.reindex_posts(es, INDEX, [fake_post(1)])
+
+
+def test_writes_create_a_missing_index_with_the_explicit_mapping():
+    es = FakeElasticsearch()
+    search.index_post(es, INDEX, fake_post(1))
+    assert es.indices.get_mapping(index=INDEX)[INDEX]["mappings"] == search.INDEX_MAPPINGS
+    search.delete_index(es, INDEX)
+    assert search.reindex_posts(es, INDEX, [fake_post(1), fake_post(2)]) == 2
+    assert search.mapping_problems(es, INDEX) == []
+
+
+def test_ensure_index_tolerates_a_concurrent_create(monkeypatch):
+    from tests.fakes import _bad_request
+
+    es = FakeElasticsearch()
+    monkeypatch.setattr(es.indices, "create", lambda **_: (_ for _ in ()).throw(_bad_request("resource_already_exists_exception")))
+    assert search.ensure_index(es, INDEX) is False
+    monkeypatch.setattr(es.indices, "create", lambda **_: (_ for _ in ()).throw(_bad_request("illegal_argument_exception")))
+    es._store.pop(INDEX, None)
+    with pytest.raises(search.SearchBackendError):
+        search.ensure_index(es, INDEX)
+
+
+def test_prepare_index_creates_extends_or_rebuilds():
+    es = FakeElasticsearch()
+    assert search.prepare_index(es, INDEX) == "created"
+    assert search.prepare_index(es, INDEX) == "ok"
+
+    search.delete_index(es, INDEX)
+    es.indices.create(index=INDEX, mappings={"properties": {"title": {"type": "text"}, "content": {"type": "text"}}})
+    es.put_raw_document(INDEX, 1, {"title": "kept"})
+    assert search.prepare_index(es, INDEX) == "extended"
+    assert search.mapping_problems(es, INDEX) == []
+    assert es.get_document(INDEX, 1) == {"title": "kept"}  # extending keeps documents
+
+    search.delete_index(es, INDEX)
+    es.indices.create(index=INDEX, mappings={"properties": {"tags": {"type": "text"}}})
+    es.put_raw_document(INDEX, 1, {"title": "lost"})
+    assert search.prepare_index(es, INDEX) == "rebuilt"
+    assert search.mapping_problems(es, INDEX) == []
+    assert es.documents(INDEX) == {}
+
+
+def test_rebuild_index_gives_up_when_the_index_keeps_reappearing(monkeypatch):
+    es = FakeElasticsearch()
+    search.ensure_index(es, INDEX)
+    monkeypatch.setattr(search, "mapping_problems", lambda *_: ["field 'tags' is mapped as 'text', expected 'keyword'"])
+    with pytest.raises(search.SearchBackendError, match="could not recreate"):
+        search.rebuild_index(es, INDEX)
+
+
+def test_stale_documents_are_found_across_pages_and_removed(monkeypatch):
+    monkeypatch.setattr(search, "SCAN_PAGE_SIZE", 2)
+    es = FakeElasticsearch()
+    search.ensure_index(es, INDEX)
+    search.reindex_posts(es, INDEX, [fake_post(i) for i in range(1, 6)])
+    stale = search.stale_document_ids(es, INDEX, keep_ids={1, 3, 5})
+    assert stale == ["2", "4"]
+    assert search.remove_documents(es, INDEX, stale) == 2
+    assert sorted(es.documents(INDEX)) == ["1", "3", "5"]
+    assert search.stale_document_ids(es, INDEX, keep_ids={1, 3, 5}) == []
+    assert search.remove_documents(es, INDEX, ["999"]) == 1  # a missing document is not an error
+
+
+def test_fake_rejects_pages_beyond_the_result_window():
+    es = FakeElasticsearch()
+    search.ensure_index(es, INDEX)
+    with pytest.raises(search.SearchBackendError, match="Result window"):
+        search.search_posts(es, INDEX, query=None, author=None, tags=[], sort="newest", page=101, size=100)
 
 
 def test_transport_errors_become_search_backend_error():

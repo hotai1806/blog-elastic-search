@@ -21,7 +21,7 @@ docker compose up --build
 ```
 
 The `app` container waits for the three services, runs `python migrate.py --init`
-(Alembic `upgrade head` + search index) and `python migrate.py --sync`, then starts
+(Alembic `upgrade head`, search index creation or upgrade, full re-index) and then starts
 Uvicorn on <http://localhost:8000>. Interactive docs: <http://localhost:8000/docs>
 (Swagger) and <http://localhost:8000/redoc>.
 
@@ -46,7 +46,7 @@ curl -s 'localhost:8000/tags/?sort=posts'
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 cp .env.example .env          # point DATABASE_URL / ELASTICSEARCH_URL / REDIS_URL at your services
-python migrate.py --init      # migrations + search index
+python migrate.py --init      # migrations + search index + re-index
 uvicorn app.main:app --reload
 ```
 
@@ -58,12 +58,12 @@ and return `total` and `pages`. Timestamps are ISO 8601 in UTC (no offset suffix
 | Method | Path | Body / query parameters | Response |
 |--------|------|-------------------------|----------|
 | `POST` | `/posts/` | `{title, content, author, tags?: [..]}` | `201` post |
-| `GET` | `/posts/` | `page`, `size`, `author`, `tag` (newest first) | `{items, total, page, size, pages}` |
+| `GET` | `/posts/` | `page`, `size`, `author`, `tag` (repeatable, AND; newest first) | `{items, total, page, size, pages}` |
 | `GET` | `/posts/{id}` | — | post (served from Redis when cached) |
 | `PUT` | `/posts/{id}` | `{title, content, author, tags?}` — full replacement; omitting `tags` clears them | post |
 | `PATCH` | `/posts/{id}` | any subset of `{title, content, author, tags}`; `tags` replaces the whole set | post |
 | `DELETE` | `/posts/{id}` | — | `204` |
-| `GET` | `/search/` | `query`, `author`, `tag` (repeatable), `sort`, `page`, `size` | `{results, total, page, size, pages, query}` |
+| `GET` | `/search/` | `query`, `author`, `tag` (repeatable, AND), `sort`, `page`, `size` | `{results, total, page, size, pages, query}` |
 | `GET` | `/tags/` | `sort=name` (default) or `sort=posts` | `[{id, name, description, created_at, post_count}]` |
 | `GET` | `/tags/{name}` | — | tag |
 | `PATCH` | `/tags/{name}` | `{description}` (`null` clears it) | tag |
@@ -92,14 +92,16 @@ cannot be reached, writes and searches answer `503` (see below).
 
 Tag names are normalised on every input (request bodies, `tag=` filters and `/tags/{name}`):
 trimmed, internal whitespace collapsed, lower-cased and de-duplicated, so `"Machine  Learning"`
-and `"machine learning"` are the same tag. Tags are created on first use, keep their
+and `"machine learning"` are the same tag. A blank tag is rejected with `422` everywhere.
+On both `GET /posts/` and `GET /search/` the `tag` parameter can be repeated
+(`?tag=python&tag=search`) and every listed tag is required. Tags are created on first use, keep their
 `description` and stay listed (with `post_count: 0`) after the last post using them is
 removed. Each tag is also stored as a keyword in the search index, so `tag=` filters are exact.
 
 ### Search
 
 `GET /search/` runs a `multi_match` query over `title` (weight 2) and `content`, with
-`author` and `tag` as exact filters. Repeating `tag` requires **every** listed tag.
+`author` and `tag` as exact filters.
 
 | Parameter | Meaning |
 |-----------|---------|
@@ -118,25 +120,41 @@ e.g. `{"title": ["Searching blogs with <em>Elasticsearch</em>"], "content": [...
   *inside* the database transaction (`flush → index → commit`, with `refresh=wait_for`), so a
   post is searchable as soon as the response returns, and if Elasticsearch is down the
   transaction is rolled back and the client gets `503` — nothing is persisted on one side only.
-  If a commit fails after the index write, `python migrate.py --sync` repairs the index.
+  Update and delete endpoints take a row lock (`SELECT … FOR UPDATE`), so concurrent writers
+  to the same post queue up and each one re-indexes the state it actually committed. If a
+  commit fails after the index write, `python migrate.py --sync` reconciles the index
+  (re-indexes every row and deletes documents that have no row).
+- **The index is never auto-created by a write.** The first write of a process checks that
+  the index exists with the explicit mapping (keyword `author`/`tags`), so a start-up while
+  Elasticsearch was down cannot leave you with Elasticsearch's dynamic mapping and silently
+  broken filters.
 - **Redis is best effort.** `GET /posts/{id}` reads through the cache (`post:{id}`, TTL
-  `CACHE_TTL_SECONDS`); updates and deletes invalidate the key. Any Redis error is logged and
-  the request is served from PostgreSQL.
+  `CACHE_TTL_SECONDS`). Readers only fill an absent key (`SET NX`), updates write the fresh
+  post through, and deletes leave a tombstone for the cache lifetime, so a slow reader that
+  fetched the row just before a write cannot leave a stale or deleted post in the cache. Any
+  Redis error is logged and the request is served from PostgreSQL. Remaining window: a
+  writer that stalls between its commit and its cache write while a later writer completes
+  both could leave the earlier value until the TTL expires.
 - **Startup never blocks on Elasticsearch.** The app creates the index if it is missing; if
   Elasticsearch is unreachable it logs a warning and keeps serving the database-backed
   endpoints (search and post writes return `503` until it is back). If the live index has an
-  outdated mapping the log tells you to run `python migrate.py --reset-index`.
-- `GET /health` pings all three services and returns `503` with `status: "degraded"` when
-  any of them fails.
+  outdated mapping the log says so; `python migrate.py --init` (or `--sync`) upgrades it.
+- `GET /health` pings all three services (with short timeouts) and returns `503` with
+  `status: "degraded"` when any of them fails.
 
 ## Database migrations and the maintenance CLI
 
 | Command | What it does |
 |---------|--------------|
 | `python migrate.py` | `alembic upgrade head` |
-| `python migrate.py --init` | migrations, then create the search index if it is missing |
-| `python migrate.py --sync` | bulk re-index every post from PostgreSQL |
+| `python migrate.py --init` | migrations; create the search index or upgrade its mapping; full re-index |
+| `python migrate.py --sync` | upgrade the mapping if needed, bulk re-index every post, delete documents with no row |
 | `python migrate.py --reset-index` | drop and recreate the index with the current mapping, then re-index |
+
+Mapping upgrades add missing fields in place; a field whose type changed cannot be altered
+by Elasticsearch, so the index is rebuilt and re-indexed from PostgreSQL. Run `--sync` and
+`--reset-index` while the app is not taking writes: a post updated while the re-index streams
+the table may be overwritten with the older snapshot until its next update.
 
 Plain Alembic works too (`alembic upgrade head`, `alembic downgrade -1`,
 `alembic revision -m "..."`); `migrations/env.py` reads `DATABASE_URL`. Migration `001` is
@@ -151,8 +169,12 @@ This version changes the HTTP contract and the search mapping:
   and return the post itself (`201` on create) instead of `{"message", "post"}`.
 - The hand-written `/docs` route is gone; FastAPI's built-in `/docs`, `/redoc` and
   `/openapi.json` replace it.
-- The index mapping now includes `id`, `tags` (keyword) and `updated_at`. Run
-  `python migrate.py --reset-index` once after deploying; until then the app logs a warning.
+- `GET /search/` now returns `{results, total, page, size, pages, query}` instead of
+  `{results, count}`, and `query` is optional.
+- The index mapping now includes `id`, `tags` (keyword) and `updated_at`.
+  `python migrate.py --init` (run automatically by the Docker image) extends an old mapping
+  in place and re-indexes every post; an index whose fields were auto-created with the wrong
+  type is rebuilt. Documents indexed by the old version remain searchable in the meantime.
 
 ## Configuration
 

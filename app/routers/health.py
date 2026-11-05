@@ -30,7 +30,9 @@ def health(
         services["database"] = f"error: {type(exc).__name__}"
 
     try:
-        services["elasticsearch"] = "ok" if es.ping() else "error: ping failed"
+        # Bounded so a black-holed host cannot stall the probe for the default 10 s x retries.
+        probe = es.options(request_timeout=2, max_retries=0)
+        services["elasticsearch"] = "ok" if probe.ping() else "error: ping failed"
     except (ApiError, TransportError) as exc:
         services["elasticsearch"] = f"error: {type(exc).__name__}"
 

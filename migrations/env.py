@@ -14,14 +14,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.models import Base  # noqa: E402
 
-# The database URL comes from the environment (falls back to alembic.ini)
-sqlalchemy_url = os.getenv("DATABASE_URL")
+# Database URL precedence: value passed programmatically (migrate.run_migrations /
+# the integration tests) > DATABASE_URL environment variable > alembic.ini
+sqlalchemy_url = config.attributes.get("database_url") or os.getenv("DATABASE_URL")
 if sqlalchemy_url:
     config.set_main_option("sqlalchemy.url", sqlalchemy_url)
 
-# Interpret the config file for Python logging
+# Interpret the config file for Python logging without disabling the application's loggers
+# (migrations run in-process from migrate.py and the tests)
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Model metadata for 'autogenerate' support
 target_metadata = Base.metadata

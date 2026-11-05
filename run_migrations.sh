@@ -1,5 +1,6 @@
 #!/bin/bash
-# run_migrations.sh
+# run_migrations.sh — wait for the backing services, then migrate the database,
+# create/upgrade the search index and re-index all posts.
 
 set -e
 
@@ -15,10 +16,7 @@ while ! nc -z elasticsearch 9200; do
 done
 echo "Elasticsearch is ready!"
 
-echo "Running database migrations..."
+echo "Running database migrations and preparing the search index..."
 python migrate.py --init
-
-echo "Syncing data to Elasticsearch..."
-python migrate.py --sync
 
 echo "Migrations completed successfully!"

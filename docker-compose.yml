@@ -20,7 +20,7 @@ services:
       - ./:/app
     networks:
       - blog_network
-    command: sh -c "./run_migrations.sh && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    command: sh -c "./run_migrations.sh && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
   postgres:
     image: postgres:15
@@ -56,8 +56,8 @@ services:
       test: ["CMD-SHELL", "curl --silent --fail http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 12
+      start_period: 60s
 
   redis:
     image: redis:7

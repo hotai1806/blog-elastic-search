@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_TAGS_PER_POST = 20
 MAX_TAG_LENGTH = 50
@@ -33,6 +33,20 @@ def normalize_tags(raw: list[str]) -> list[str]:
             result.append(name)
     if len(result) > MAX_TAGS_PER_POST:
         raise ValueError(f"a post can have at most {MAX_TAGS_PER_POST} tags")
+    return result
+
+
+def parse_tag_filters(raw: list[str]) -> list[str]:
+    """Normalise ``tag`` query-parameter values (de-duplicated); blank or over-long values are a ValueError."""
+    result: list[str] = []
+    for item in raw:
+        name = normalize_tag(item)
+        if not name:
+            raise ValueError("tag must not be blank")
+        if len(name) > MAX_TAG_LENGTH:
+            raise ValueError(f"tag must be at most {MAX_TAG_LENGTH} characters")
+        if name not in result:
+            result.append(name)
     return result
 
 
@@ -98,6 +112,15 @@ class PostList(BaseModel):
 class SearchHit(PostOut):
     score: Optional[float] = None
     highlights: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _tolerate_legacy_documents(cls, data):
+        """Documents indexed by earlier versions lack ``updated_at``; keep search working
+        until ``migrate.py --sync`` has rewritten them."""
+        if isinstance(data, dict) and data.get("updated_at") is None and data.get("created_at") is not None:
+            data = {**data, "updated_at": data["created_at"]}
+        return data
 
 
 class SearchResponse(BaseModel):

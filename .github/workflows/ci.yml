@@ -47,7 +47,8 @@ jobs:
           --health-cmd "curl --silent --fail http://localhost:9200/_cluster/health || exit 1"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 12
+          --health-start-period 60s
       redis:
         image: redis:7
         ports:

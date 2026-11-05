@@ -18,15 +18,16 @@ from alembic.config import Config
 from elasticsearch import Elasticsearch
 from fastapi.testclient import TestClient
 from sqlalchemy import ARRAY, String, create_engine, inspect, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 import migrate
-from app import search
+from app import cache, search
 from app.config import settings
 from app.database import get_db
 from app.deps import get_es, get_redis
 from app.main import app
-from app.models import Tag
+from app.models import BlogPost, Tag
 from app.schemas import PostCreate
 from app.services import posts as posts_service
 
@@ -48,8 +49,7 @@ ALL_TABLES = ["post_tags", "tags", "blog_posts", "alembic_version"]
 
 
 def alembic_config() -> Config:
-    os.environ["DATABASE_URL"] = DB_URL  # read by migrations/env.py
-    return Config(str(ALEMBIC_INI))
+    return migrate.alembic_config(DB_URL)
 
 
 def drop_everything(engine) -> None:
@@ -171,7 +171,7 @@ def test_post_lifecycle_end_to_end(client, es_client, redis_client, session_fact
     # update invalidates the cache and re-indexes
     updated = client.put(f"/posts/{first['id']}", json={"title": "Renamed", "content": "x", "author": "alice", "tags": ["renamed"]})
     assert updated.status_code == 200, updated.text
-    assert redis_client.exists(f"post:{first['id']}") == 0
+    assert cache.get_cached_post(redis_client, first["id"]).title == "Renamed"  # written through
     assert ids(client.get("/search/", params={"query": "renamed"})) == [first["id"]]
     assert ids(client.get("/search/", params={"query": "basics"})) == []
     assert client.get(f"/posts/{first['id']}").json()["title"] == "Renamed"
@@ -188,7 +188,7 @@ def test_post_lifecycle_end_to_end(client, es_client, redis_client, session_fact
     assert client.delete(f"/posts/{first['id']}").status_code == 204
     assert client.get(f"/posts/{first['id']}").status_code == 404
     assert not es_client.exists(index=TEST_INDEX, id=first["id"])
-    assert redis_client.exists(f"post:{first['id']}") == 0
+    assert redis_client.get(f"post:{first['id']}") == cache.TOMBSTONE
     with session_factory() as db:
         assert db.scalar(select(Tag).where(Tag.name == "renamed")) is not None
 
@@ -219,7 +219,7 @@ def test_reindex_from_database_rebuilds_the_index(client, es_client, session_fac
     search.delete_index(es_client, TEST_INDEX)
     monkeypatch.setattr(migrate, "SessionLocal", session_factory)
     monkeypatch.setattr(migrate, "get_es_client", lambda: es_client)
-    assert migrate.reset_search_index() == 3
+    assert migrate.reset_search_index() == (3, 0)
     assert ids(client.get("/search/", params={"tag": "bulk", "sort": "oldest"})) == [p["id"] for p in posts]
     assert search.mapping_problems(es_client, TEST_INDEX) == []
 
@@ -251,19 +251,97 @@ def test_upgrade_from_pre_alembic_database(engine, es_client):
         conn.execute(text("CREATE INDEX ix_blog_posts_id ON blog_posts (id)"))
         conn.execute(text(
             "INSERT INTO blog_posts (title, content, author, created_at) "
-            "VALUES ('old', 'legacy row', 'tai', '2025-01-01 00:00:00')"
+            "VALUES ('old', 'legacy row', 'tai', '2025-01-01 00:00:00'), ('nullrow', 'no timestamp', 'tai', NULL)"
         ))
     command.upgrade(cfg, "head")
 
     inspector = inspect(engine)
-    columns = {col["name"] for col in inspector.get_columns("blog_posts")}
-    assert {"tags", "updated_at"} <= columns
+    columns = {col["name"]: col for col in inspector.get_columns("blog_posts")}
+    assert {"tags", "updated_at"} <= set(columns)
+    assert columns["created_at"]["nullable"] is False
     assert {"tags", "post_tags"} <= set(inspector.get_table_names())
     with engine.connect() as conn:
-        created, updated = conn.execute(text("SELECT created_at, updated_at FROM blog_posts")).one()
-        assert updated == created
+        rows = conn.execute(text("SELECT title, created_at, updated_at FROM blog_posts ORDER BY id")).all()
+        assert all(created is not None and updated == created for _title, created, updated in rows)
+        assert rows[0][1].isoformat() == "2025-01-01T00:00:00"
 
     # and the migration chain is reversible
     command.downgrade(cfg, "base")
     assert "blog_posts" not in inspect(engine).get_table_names()
     command.upgrade(cfg, "head")
+
+
+def test_write_endpoints_lock_the_row(client, session_factory):
+    post = create(client, title="locked")
+    locker = session_factory()
+    try:
+        assert posts_service.get_post(locker, post["id"], for_update=True) is not None
+        with session_factory() as other:
+            other.execute(text("SET lock_timeout = '300ms'"))
+            with pytest.raises(OperationalError):
+                posts_service.get_post(other, post["id"], for_update=True)
+            other.rollback()
+    finally:
+        locker.rollback()
+        locker.close()
+    # once the lock is released the second writer proceeds and sees the committed row
+    with session_factory() as other:
+        assert posts_service.get_post(other, post["id"], for_update=True).title == "locked"
+        other.rollback()
+
+
+def test_list_posts_requires_every_tag(client):
+    both = create(client, title="both", tags=["alpha", "beta"])
+    create(client, title="alpha only", tags=["alpha"])
+    response = client.get("/posts/", params={"tag": ["Alpha", "beta"]})
+    assert [p["id"] for p in response.json()["items"]] == [both["id"]]
+    assert client.get("/posts/", params={"tag": " "}).status_code == 422
+
+
+def test_sync_reconciles_orphan_documents(client, es_client, session_factory, monkeypatch):
+    kept = [create(client, title=f"kept {i}") for i in range(2)]
+    es_client.index(index=TEST_INDEX, id=424242, document={"id": 424242, "title": "orphan", "content": "", "author": "x",
+                    "tags": [], "created_at": "2024-01-01T00:00:00", "updated_at": "2024-01-01T00:00:00"}, refresh="wait_for")
+    assert ids(client.get("/search/", params={"query": "orphan"})) == [424242]
+    monkeypatch.setattr(migrate, "SessionLocal", session_factory)
+    monkeypatch.setattr(migrate, "get_es_client", lambda: es_client)
+    assert migrate.sync_search_index() == (2, 1)
+    assert ids(client.get("/search/", params={"query": "orphan"})) == []
+    assert ids(client.get("/search/", params={"sort": "oldest"})) == [p["id"] for p in kept]
+
+
+def test_prepare_index_upgrades_legacy_mappings(client, es_client, session_factory, monkeypatch):
+    # (a) the mapping the original one-file app created: extend in place, keep documents
+    search.delete_index(es_client, TEST_INDEX)
+    es_client.indices.create(index=TEST_INDEX, mappings={"properties": {
+        "title": {"type": "text"}, "content": {"type": "text"}, "author": {"type": "keyword"}, "created_at": {"type": "date"}}})
+    es_client.index(index=TEST_INDEX, id=5, document={"title": "Legacy post", "content": "from before", "author": "old",
+                    "created_at": "2024-01-01T00:00:00"}, refresh="wait_for")
+    assert search.prepare_index(es_client, TEST_INDEX) == "extended"
+    assert search.mapping_problems(es_client, TEST_INDEX) == []
+    response = client.get("/search/", params={"query": "legacy"})
+    assert response.status_code == 200
+    assert response.json()["results"][0]["updated_at"] == "2024-01-01T00:00:00"
+    # new writes use the keyword mapping, so multi-word tags filter exactly
+    tagged = create(client, title="new", author="Jane Doe", tags=["machine learning"])
+    assert ids(client.get("/search/", params={"tag": "machine learning"})) == [tagged["id"]]
+    assert ids(client.get("/search/", params={"author": "Jane Doe"})) == [tagged["id"]]
+
+    # (b) an index whose fields were auto-created with the wrong type: rebuilt, then re-indexed
+    search.delete_index(es_client, TEST_INDEX)
+    es_client.indices.create(index=TEST_INDEX, mappings={"properties": {"tags": {"type": "text"}, "author": {"type": "text"}}})
+    monkeypatch.setattr(migrate, "SessionLocal", session_factory)
+    monkeypatch.setattr(migrate, "get_es_client", lambda: es_client)
+    assert migrate.setup_search_index() == "rebuilt"
+    assert search.mapping_problems(es_client, TEST_INDEX) == []
+    assert migrate.sync_search_index(prepare=False) == (1, 0)
+    assert ids(client.get("/search/", params={"tag": "machine learning"})) == [tagged["id"]]
+
+
+def test_first_write_after_startup_without_index_uses_the_mapping(client, es_client):
+    """Elasticsearch down at startup, back for the first write: no dynamic mapping."""
+    search.delete_index(es_client, TEST_INDEX)
+    search.forget_verified_indexes()
+    tagged = create(client, title="late", author="John Smith", tags=["machine learning"])
+    assert search.mapping_problems(es_client, TEST_INDEX) == []
+    assert ids(client.get("/search/", params={"author": "John Smith", "tag": "machine learning"})) == [tagged["id"]]

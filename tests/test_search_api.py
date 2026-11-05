@@ -64,7 +64,9 @@ def test_search_pagination(seeded):
 def test_search_rejects_result_window_overflow(client):
     response = client.get("/search/", params={"page": 101, "size": 100})
     assert response.status_code == 422
-    assert "10000" in response.json()["detail"]
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["query", "page"]
+    assert "10000" in error["msg"]
     assert client.get("/search/", params={"page": 100, "size": 100}).status_code == 200
 
 
@@ -84,3 +86,22 @@ def test_search_reflects_updates_and_deletes(seeded):
     assert ids(seeded.get("/search/", params={"query": "elasticsearch"})) == [3, 1, 2]
     seeded.delete("/posts/1")
     assert ids(seeded.get("/search/", params={"query": "elasticsearch"})) == [3, 2]
+
+
+def test_search_rejects_blank_tag(seeded):
+    response = seeded.get("/search/", params={"tag": ["python", "  "]})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["query", "tag"]
+
+
+def test_search_tolerates_documents_indexed_by_older_versions(seeded, fake_es):
+    from tests.conftest import INDEX
+
+    fake_es.put_raw_document(
+        INDEX, 77,
+        {"id": 77, "title": "Legacy elasticsearch post", "content": "old", "author": "x", "created_at": "2024-01-01T00:00:00"},
+    )
+    response = seeded.get("/search/", params={"query": "legacy"})
+    assert response.status_code == 200
+    hit = response.json()["results"][0]
+    assert (hit["id"], hit["tags"], hit["updated_at"]) == (77, [], "2024-01-01T00:00:00")
