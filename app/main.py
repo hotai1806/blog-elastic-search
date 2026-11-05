@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             if problems:
                 logger.warning(
                     "Elasticsearch index %r has an outdated mapping (%s). "
-                    "Run `python migrate.py --reset-index` to rebuild it.",
+                    "Run `python migrate.py --init` to upgrade it.",
                     index,
                     "; ".join(problems),
                 )

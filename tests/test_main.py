@@ -35,7 +35,7 @@ def test_lifespan_warns_about_outdated_mapping(monkeypatch, caplog):
         with TestClient(app):
             pass
     assert "outdated mapping" in caplog.text
-    assert "--reset-index" in caplog.text
+    assert "--init" in caplog.text
 
 
 def test_openapi_metadata_and_routes(client):
